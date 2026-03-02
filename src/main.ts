@@ -58,7 +58,7 @@ import { ribbonIcons } from './icons'
 import { APP_VERSION } from './core/appInfo'
 import type { UpdateAssetInfo, CheckUpdateResp, UpdateExtra } from './core/updateTypes'
 // htmlToMarkdown 改为按需动态导入（仅在粘贴 HTML 时使用）
-import { initWebdavSync, openWebdavSyncDialog, getWebdavSyncConfig, isWebdavConfiguredForActiveLibrary, syncNow as webdavSyncNow, setOnSyncComplete, openSyncLog as webdavOpenSyncLog } from './extensions/webdavSync'
+import { initWebdavSync, openWebdavSyncDialog, getWebdavSyncConfig, isWebdavConfiguredForActiveLibrary, syncNow as webdavSyncNow, setOnSyncComplete, openSyncLog as webdavOpenSyncLog, appendSyncLog as webdavAppendSyncLog } from './extensions/webdavSync'
 import { initSpeechTranscribeFeature } from './extensions/speechTranscribe'
 import { initAsrNoteFeature } from './extensions/asrNote'
 // 平台适配层（Android 支持）
@@ -10001,6 +10001,14 @@ function bindEvents() {
   // 使用 Tauri 原生 ask 更稳定；必要时再降级到 confirm。
   try {
     void getCurrentWindow().onCloseRequested(async (event) => {
+      // 永远先拦截默认关闭：Tauri 不会等待这里的异步逻辑，必须自己决定何时真正退出
+      try { event.preventDefault() } catch {}
+
+      const win = getCurrentWindow()
+      const destroyWin = async () => {
+        try { await win.destroy() } catch { try { await win.close() } catch {} }
+      }
+
       let portableActive = false
       try { portableActive = await isPortableModeEnabled() } catch {}
       const runPortableExportOnExit = async () => {
@@ -10015,13 +10023,58 @@ function bindEvents() {
           try { await exportPortableBackupSilent() } catch (err) { console.warn('[Portable] 关闭时导出失败', err) }
         }
       }
+
+      const restoreStickyIfNeeded = async () => {
+        // 便签模式：关闭前先恢复窗口大小和位置，避免 tauri-plugin-window-state 记住便签的小窗口尺寸
+        if (stickyNoteMode) {
+          try { await restoreWindowStateBeforeSticky() } catch {}
+        }
+      }
+
+      const runShutdownSyncIfEnabled = async (): Promise<boolean> => {
+        try {
+          const cfg = await getWebdavSyncConfig()
+          if (!(cfg.enabled && cfg.onShutdown)) return false
+
+          // 关闭前同步至少要留一条“触发”日志，方便用户事后核对
+          try { await webdavAppendSyncLog('[shutdown-once] 收到关闭请求，准备执行关闭前同步') } catch {}
+
+          // 隐藏窗口到后台，避免用户以为卡死
+          try { await win.hide() } catch {}
+
+          const t0 = Date.now()
+          let summary = 'unknown'
+          try {
+            const result = await webdavSyncNow('shutdown')
+            if (!result) summary = 'failed(null)'
+            else if ((result as any).skipped) summary = 'skipped'
+            else summary = `ok up=${result.uploaded} down=${result.downloaded}`
+          } catch (e) {
+            summary = 'error ' + String((e as any)?.message || e || '')
+          }
+          const cost = Date.now() - t0
+          try { await webdavAppendSyncLog(`[shutdown-once] 关闭前同步结束 cost=${cost}ms ${summary}`) } catch {}
+
+          // 短暂延迟确保日志写入完成
+          try { await new Promise(r => setTimeout(r, 500)) } catch {}
+          return true
+        } catch {
+          return false
+        }
+      }
+
+      const exitNow = async () => {
+        try { await restoreStickyIfNeeded() } catch {}
+        try { await runPortableExportOnExit() } catch {}
+        try { await runShutdownSyncIfEnabled() } catch {}
+        try { await destroyWin() } catch {}
+      }
+
       if (!dirty) {
-        await runPortableExportOnExit()
+        await exitNow()
         return
       }
 
-      // 阻止默认关闭，进行异步确认
-      event.preventDefault()
       try { await saveCurrentDocPosNow() } catch {}
 
       let shouldExit = false
@@ -10066,26 +10119,7 @@ function bindEvents() {
       }
 
       if (shouldExit) {
-        // 便签模式：关闭前先恢复窗口大小和位置，避免 tauri-plugin-window-state 记住便签的小窗口尺寸
-        if (stickyNoteMode) {
-          try { await restoreWindowStateBeforeSticky() } catch {}
-        }
-        await runPortableExportOnExit()
-        // 若启用“关闭前同步”，沿用后台隐藏 + 同步 + 退出的策略
-        try {
-          const cfg = await getWebdavSyncConfig()
-          if (cfg.enabled && cfg.onShutdown) {
-            const win = getCurrentWindow()
-            try { await win.hide() } catch {}
-            try { await webdavSyncNow('shutdown') } catch {}
-            try { await new Promise(r => setTimeout(r, 300)) } catch {}
-            try { await win.destroy() } catch {}
-            return
-          }
-        } catch {}
-
-        // 未启用关闭前同步，直接退出
-        try { await getCurrentWindow().destroy() } catch { try { await getCurrentWindow().close() } catch {} }
+        await exitNow()
       }
     })
   } catch (e) {

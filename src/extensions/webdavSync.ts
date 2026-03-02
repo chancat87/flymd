@@ -664,6 +664,11 @@ async function syncLog(msg: string): Promise<void> {
   } catch {}
 }
 
+// 主入口（src/main.ts）在“关闭前同步”场景需要额外记一条日志，避免关窗时定位困难
+export async function appendSyncLog(msg: string): Promise<void> {
+  await syncLog(msg)
+}
+
 // HTTP 请求重试：最多 3 次，指数退避 + 抖动
 const MAX_HTTP_RETRIES = 3
 
@@ -706,8 +711,6 @@ export async function openSyncLog(): Promise<void> {
     alert('打开日志失败: ' + ((e as any)?.message || e))
   }
 }
-
-import { getCurrentWindow } from '@tauri-apps/api/window'
 
 // 本地结构快照（存放于库根目录），用于快速短路“无变化”的同步
 // 注意：仅作为性能优化的提示，真实一致性仍由常规流程保障
@@ -3018,65 +3021,7 @@ export async function initWebdavSync(): Promise<void> {
     // 启动后触发一次
     if (cfg.enabled && cfg.onStartup) { setTimeout(() => { void syncNow('startup') }, 600) }
 
-    // 关闭前同步 - 改进：阻止关闭，隐藏窗口，后台同步完成后退出
-    try {
-      const appWin = getCurrentWindow()
-      appWin.onCloseRequested(async (event) => {
-        try {
-          // 若有未保存更改，交由主入口的关闭询问处理
-          const isDirty = !!((globalThis as any)?.flymdIsDirty?.())
-          if (isDirty) {
-            event.preventDefault()
-            return
-          }
-
-          const c = await getWebdavSyncConfig()
-          if (c.enabled && c.onShutdown) {
-            // 阻止立即关闭
-            event.preventDefault()
-
-            await syncLog('[shutdown] 关闭前同步已启用，窗口将隐藏至后台')
-            console.log('[WebDAV Sync] 关闭前同步开始，窗口隐藏')
-
-            // 隐藏窗口到后台
-            try {
-              await appWin.hide()
-              updateStatus('后台同步中，完成后将自动退出...')
-            } catch (e) {
-              console.warn('隐藏窗口失败:', e)
-            }
-
-            // 执行同步
-            const result = await syncNow('shutdown')
-
-            await syncLog('[shutdown] 同步完成，准备退出程序')
-            console.log('[WebDAV Sync] 同步完成，退出程序')
-
-            // 同步完成后真正退出
-            try {
-              // 短暂延迟确保日志写入完成
-              await new Promise(resolve => setTimeout(resolve, 500))
-              await appWin.destroy()
-            } catch (e) {
-              console.warn('退出程序失败:', e)
-              // 如果 destroy 失败，尝试 close
-              try {
-                await appWin.close()
-              } catch {}
-            }
-          }
-        } catch (e) {
-          console.error('关闭前同步出错:', e)
-          await syncLog('[shutdown-error] ' + ((e as any)?.message || e))
-          // 出错时也要退出，不能卡住
-          try {
-            await getCurrentWindow().destroy()
-          } catch {}
-        }
-      })
-    } catch (e) {
-      console.warn('注册关闭事件失败:', e)
-    }
+    // 关闭前同步：统一由主入口（src/main.ts）处理，避免重复注册 close 监听导致时序/交互混乱
   } catch {}
 }
 
