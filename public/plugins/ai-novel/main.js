@@ -99,6 +99,10 @@ const DEFAULT_CFG = {
     // 严格人物状态约束：true=必须保持一致，false=作为参考（默认严格）
     strictCharState: true
   },
+  outline: {
+    // 严格遵循章节大纲：若无法匹配到“当前章”的大纲内容，则拒绝生成（避免剧情跑偏）
+    strict: false
+  },
   agent: {
     // Agent（Plan/TODO）模式：把一次写作拆成多轮执行，提高上限与一致性（代价：更耗字符/更慢）
     enabled: false,
@@ -159,6 +163,7 @@ async function loadCfg(ctx) {
         const rr = raw.rag && typeof raw.rag === 'object' ? raw.rag : {}
         const rrs = rr.subIndex && typeof rr.subIndex === 'object' ? rr.subIndex : {}
         const rcon = raw.constraints && typeof raw.constraints === 'object' ? raw.constraints : {}
+        const rol = raw.outline && typeof raw.outline === 'object' ? raw.outline : {}
         const ra = raw.agent && typeof raw.agent === 'object' ? raw.agent : {}
         const rawAuto = raw.autoWrite && typeof raw.autoWrite === 'object' ? raw.autoWrite : {}
         out.upstream = { ...DEFAULT_CFG.upstream, ...ru }
@@ -169,6 +174,7 @@ async function loadCfg(ctx) {
         // rag.subIndex 需要再深合并一层：否则用户只改一个字段会把默认字段整个覆盖掉
         out.rag.subIndex = { ...(DEFAULT_CFG.rag.subIndex || {}), ...rrs }
         out.constraints = { ...DEFAULT_CFG.constraints, ...rcon }
+        out.outline = { ...DEFAULT_CFG.outline, ...rol }
         out.agent = { ...DEFAULT_CFG.agent, ...ra }
         out.autoWrite = { ...DEFAULT_CFG.autoWrite, ...rawAuto }
       } catch {}
@@ -209,6 +215,7 @@ async function saveCfg(ctx, patch) {
       if (p.rag.subIndex && typeof p.rag.subIndex === 'object') out.rag.subIndex = { ...((cur.rag && cur.rag.subIndex) || {}), ...p.rag.subIndex }
     }
     if (p.constraints && typeof p.constraints === 'object') out.constraints = { ...(cur.constraints || {}), ...p.constraints }
+    if (p.outline && typeof p.outline === 'object') out.outline = { ...(cur.outline || {}), ...p.outline }
     if (p.agent && typeof p.agent === 'object') out.agent = { ...(cur.agent || {}), ...p.agent }
     if (p.autoWrite && typeof p.autoWrite === 'object') out.autoWrite = { ...(cur.autoWrite || {}), ...p.autoWrite }
   } catch {}
@@ -1428,13 +1435,63 @@ async function getBibleDocText(ctx, cfg) {
     const sections = [
       // 兼容旧项目/手动改名：同一分节允许多个候选文件名，按顺序取第一个存在且非空的。
       { key: 'bible', w: 0.35, head: 0.55, title: t('【故事圣经】', '[Bible]'), files: ['02_故事圣经.md', '02_故事资料.md', '02_圣经.md'] },
-      { key: 'world', w: 0.20, head: 0.70, title: t('【世界设定】', '[World]'), files: ['02_世界设定.md', '02_设定.md', '02_世界观.md'] },
+      // 目录支持：02_世界设定/（优先 00_摘要.md；用于多书复用/拆分管理）
+      { key: 'world', w: 0.20, head: 0.70, title: t('【世界设定】', '[World]'), files: ['02_世界设定.md', '02_设定.md', '02_世界观.md'], dirs: ['02_世界设定'] },
       { key: 'chars', w: 0.25, head: 0.85, title: t('【主要角色】', '[Characters]'), files: ['03_主要角色.md', '03_主要人物.md', '03_角色设定.md', '03_人物设定.md'] },
       { key: 'rels', w: 0.10, head: 0.80, title: t('【人物关系】', '[Relations]'), files: ['04_人物关系.md', '04_关系.md', '04_角色关系.md'] },
-      { key: 'outline', w: 0.10, head: 0.80, title: t('【章节大纲】', '[Outline]'), files: ['05_章节大纲.md', '05_大纲.md', '05_剧情大纲.md'] },
+      // 目录支持：05_章节大纲/（优先 00_摘要.md；严格大纲模式会按章精确匹配）
+      { key: 'outline', w: 0.10, head: 0.80, title: t('【章节大纲】', '[Outline]'), files: ['05_章节大纲.md', '05_大纲.md', '05_剧情大纲.md'], dirs: ['05_章节大纲'] },
     ]
 
-    async function readFirstNonEmpty(fileList) {
+    async function readMetaDirText(dirNames, capChars) {
+      const dirs = Array.isArray(dirNames) ? dirNames.map((x) => safeFileName(x, '')).filter(Boolean) : []
+      if (!dirs.length) return ''
+      const cap = Math.max(2000, (capChars | 0) || 20000)
+
+      for (let d = 0; d < dirs.length; d++) {
+        const dirAbs = joinFsPath(inf.projectAbs, dirs[d])
+        let files = []
+        try { files = await listMarkdownFilesAny(ctx, dirAbs) } catch { files = [] }
+        files = Array.isArray(files) ? files.filter(Boolean) : []
+        if (!files.length) continue
+
+        // 优先 00_摘要.md，其余按文件名排序拼接；超过 cap 就停止（避免无意义爆炸）
+        files.sort((a, b) => {
+          const ba = fsBaseName(a)
+          const bb = fsBaseName(b)
+          const sa = (ba === '00_摘要.md' || ba === '00_摘要.markdown' || ba === '00_摘要.txt') ? 0 : 1
+          const sb = (bb === '00_摘要.md' || bb === '00_摘要.markdown' || bb === '00_摘要.txt') ? 0 : 1
+          if (sa !== sb) return sa - sb
+          return String(ba || '').localeCompare(String(bb || ''), 'zh-Hans-CN-u-co-pinyin')
+        })
+
+        const parts = []
+        let used = 0
+        for (let i = 0; i < files.length; i++) {
+          if (used >= cap) break
+          const p = files[i]
+          try {
+            const raw = await readTextAny(ctx, p)
+            const s = safeText(raw).trim()
+            if (!s) continue
+            // 不要把文件名当成正文标题硬塞进来：模型更关心内容；这里简单拼接即可
+            parts.push(s)
+            used += s.length
+          } catch {}
+        }
+        const out = parts.join('\n\n').trim()
+        if (out) return out
+      }
+      return ''
+    }
+
+    async function readFirstNonEmpty(fileList, dirNames) {
+      // 先试目录：更适合“拆分复用”
+      try {
+        const dirText = await readMetaDirText(dirNames, Math.floor(limit * 2.2))
+        if (safeText(dirText).trim()) return dirText
+      } catch {}
+
       for (let i = 0; i < fileList.length; i++) {
         const abs = joinFsPath(inf.projectAbs, fileList[i])
         try {
@@ -1449,7 +1506,7 @@ async function getBibleDocText(ctx, cfg) {
     const present = []
     for (let i = 0; i < sections.length; i++) {
       const sec = sections[i]
-      const raw = await readFirstNonEmpty(sec.files)
+      const raw = await readFirstNonEmpty(sec.files, sec.dirs)
       if (!raw) continue
       present.push({ ...sec, raw })
     }
@@ -1470,6 +1527,268 @@ async function getBibleDocText(ctx, cfg) {
   } catch {
     return ''
   }
+}
+
+function _ainOutlineIsStrictEnabled(cfg, override) {
+  // override: 显式传入 true/false 时优先；否则使用 cfg.outline.strict
+  if (override === true || override === false) return !!override
+  try {
+    const ol = cfg && cfg.outline && typeof cfg.outline === 'object' ? cfg.outline : {}
+    return !!ol.strict
+  } catch {
+    return false
+  }
+}
+
+async function _ainInferCurrentChapterInfo(ctx, cfg) {
+  // 严格大纲模式：必须能确定“当前章”，否则就是让 AI 猜（那叫放屁）
+  const inf = await inferProjectDir(ctx, cfg)
+  if (!inf) return null
+  let curPath = ''
+  try {
+    if (ctx && typeof ctx.getCurrentFilePath === 'function') curPath = String(await ctx.getCurrentFilePath() || '')
+  } catch {}
+  const p = normFsPath(curPath)
+  if (!p) return null
+
+  const chapNo = _ainParseChapterNoFromFileBaseName(fsBaseName(p))
+  if (!(chapNo > 0)) return null
+  const chapZh = zhNumber(chapNo)
+  const volNo = _ainParseVolumeNoFromChapterPath(p)
+  const volZh = volNo > 0 ? zhNumber(volNo) : ''
+
+  return { ...inf, chapNo, chapZh, volNo, volZh, chapPathAbs: p }
+}
+
+function _ainOutlineNormLines(text) {
+  const s = safeText(text).replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/^\uFEFF/, '')
+  return s.split('\n')
+}
+
+function _ainOutlineAnyVolumeLineRe() {
+  // 宽松匹配：标题/列表都支持；也兼容目录名式的“卷02_第二卷”
+  // 注意：不要用 \\b（中文不是 \\w），否则会匹配失败。
+  return /^(?:\s{0,6}(?:#{1,6}\s*)?(?:[-*+•]\s*)?)?(?:第\s*(\d{1,3}|[零〇一二三四五六七八九十百两]{1,10})\s*卷(?:\s|[:：、，。.!?？]|$)|卷\s*0*(\d{1,3})(?:\s|_|[:：、，。.!?？]|$))/u
+}
+
+function _ainOutlineAnyChapterLineRe() {
+  // 注意：不要用 \\b（中文不是 \\w），否则会匹配失败。
+  return /^(?:\s{0,6}(?:#{1,6}\s*)?(?:[-*+•]\s*)?)第\s*(\d{1,4}|[零〇一二三四五六七八九十百两]{1,10})\s*章(?:\s|[:：、，。.!?？]|$)/u
+}
+
+function _ainOutlineBuildVolumeLineRe(volNo, volZh) {
+  const n = volNo | 0
+  const zh = safeText(volZh).trim()
+  if (!(n > 0) && !zh) return null
+  const a = n > 0 ? String(n) : ''
+  const b = zh ? zh.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : ''
+  // 兼容：第2卷 / 第 二 卷 / 卷02 / 卷2_第二卷
+  const pat = [
+    '^(?:\\s{0,6}(?:#{1,6}\\s*)?(?:[-*+•]\\s*)?)?',
+    '(?:',
+    (a ? (`第\\s*${a}\\s*卷(?:\\s|[:：、，。.!?？]|$)`) : ''),
+    (a && b ? '|' : ''),
+    (b ? (`第\\s*${b}\\s*卷(?:\\s|[:：、，。.!?？]|$)`) : ''),
+    (a ? (`|卷\\s*0*${a}(?:\\s|_|[:：、，。.!?？]|$)`) : ''),
+    ')'
+  ].join('')
+  return new RegExp(pat, 'u')
+}
+
+function _ainOutlineBuildChapterLineRe(chapNo, chapZh) {
+  const n = chapNo | 0
+  const zh = safeText(chapZh).trim()
+  if (!(n > 0) && !zh) return null
+  const a = n > 0 ? String(n) : ''
+  const b = zh ? zh.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : ''
+  const pat = [
+    '^(?:\\s{0,6}(?:#{1,6}\\s*)?(?:[-*+•]\\s*)?)?',
+    '(?:',
+    (a ? (`第\\s*${a}\\s*章`) : ''),
+    (a && b ? '|' : ''),
+    (b ? (`第\\s*${b}\\s*章`) : ''),
+    ')',
+    '(?:\\s|[:：、，。.!?？]|$)'
+  ].join('')
+  return new RegExp(pat, 'u')
+}
+
+function _ainOutlineExtractChapterBlockFromText(text, chapNo, chapZh, volNo, volZh) {
+  const lines = _ainOutlineNormLines(text)
+  if (!lines.length) return ''
+
+  let start = 0
+  let end = lines.length
+
+  // 先尝试定位卷（可选）：能定位就缩小搜索范围，减少误匹配
+  if ((volNo | 0) > 0 || safeText(volZh).trim()) {
+    const reVol = _ainOutlineBuildVolumeLineRe(volNo, volZh)
+    if (reVol) {
+      let sVol = -1
+      for (let i = 0; i < lines.length; i++) {
+        const ln = String(lines[i] || '')
+        if (reVol.test(ln.trim())) { sVol = i; break }
+      }
+      if (sVol >= 0) {
+        const reAnyVol = _ainOutlineAnyVolumeLineRe()
+        let eVol = lines.length
+        for (let j = sVol + 1; j < lines.length; j++) {
+          const ln = String(lines[j] || '')
+          if (reAnyVol.test(ln.trim())) { eVol = j; break }
+        }
+        start = sVol
+        end = eVol
+      }
+    }
+  }
+
+  const reChap = _ainOutlineBuildChapterLineRe(chapNo, chapZh)
+  if (!reChap) return ''
+
+  let sChap = -1
+  for (let i = start; i < end; i++) {
+    const ln = String(lines[i] || '')
+    if (reChap.test(ln.trim())) { sChap = i; break }
+  }
+  if (sChap < 0) return ''
+
+  // 章节块到“下一个章节标题/条目”结束
+  const reAnyChap = _ainOutlineAnyChapterLineRe()
+  let eChap = end
+  for (let j = sChap + 1; j < end; j++) {
+    const ln = String(lines[j] || '')
+    if (reAnyChap.test(ln.trim())) { eChap = j; break }
+  }
+
+  const raw = lines.slice(sChap, eChap).join('\n').trim()
+  if (!raw) return ''
+  // 严格模式下注入也不能无限长：否则上下文预算一爆，反而会被裁剪得更惨
+  return sliceHeadTail(raw, 3200, 0.55).trim()
+}
+
+function _ainOutlineScoreFileNameForChapter(baseName, chapNo, chapZh) {
+  const bn = safeText(baseName).trim()
+  if (!bn) return 999
+  if (bn === '00_摘要.md' || bn === '00_摘要.markdown' || bn === '00_摘要.txt') return 50
+  const n = chapNo | 0
+  const pad = n > 0 ? String(n).padStart(3, '0') : ''
+  if (pad && bn.startsWith(pad + '_')) return 0
+  if (n > 0 && bn.includes(`第${n}章`)) return 1
+  if (chapZh && bn.includes(`第${chapZh}章`)) return 1
+  return 100
+}
+
+async function _ainFindOutlineForCurrentChapter(ctx, cfg, strict) {
+  const info = await _ainInferCurrentChapterInfo(ctx, cfg)
+  if (!info) {
+    if (strict) {
+      throw new Error(t(
+        '严格大纲模式：无法确定当前章。请打开章节文件（位于 03_章节/ 下，文件名形如 001_第一章.md）再续写。',
+        'Strict outline: cannot infer current chapter. Open a chapter file under 03_章节/ (e.g. 001_第一章.md) before writing.'
+      ))
+    }
+    return null
+  }
+  return await _ainFindOutlineForChapter(ctx, cfg, info, strict)
+}
+
+async function _ainFindOutlineForChapter(ctx, cfg, info, strict) {
+  const base = (info && typeof info === 'object') ? info : null
+  if (!base) return null
+
+  const OUTLINE_FILES = ['05_章节大纲.md', '05_大纲.md', '05_剧情大纲.md']
+  const OUTLINE_DIRS = ['05_章节大纲', '05_大纲', '05_剧情大纲']
+
+  const tryText = (text) => _ainOutlineExtractChapterBlockFromText(text, base.chapNo, base.chapZh, base.volNo, base.volZh)
+
+  // 目录优先：更符合“拆分复用”
+  for (let d = 0; d < OUTLINE_DIRS.length; d++) {
+    const dirAbs = joinFsPath(base.projectAbs, OUTLINE_DIRS[d])
+    let files = []
+    try { files = await listMarkdownFilesAny(ctx, dirAbs) } catch { files = [] }
+    files = Array.isArray(files) ? files.filter(Boolean) : []
+    if (!files.length) continue
+
+    files.sort((a, b) => {
+      const sa = _ainOutlineScoreFileNameForChapter(fsBaseName(a), base.chapNo, base.chapZh)
+      const sb = _ainOutlineScoreFileNameForChapter(fsBaseName(b), base.chapNo, base.chapZh)
+      if (sa !== sb) return sa - sb
+      return String(fsBaseName(a) || '').localeCompare(String(fsBaseName(b) || ''), 'zh-Hans-CN-u-co-pinyin')
+    })
+
+    for (let i = 0; i < files.length; i++) {
+      const p = files[i]
+      try {
+        const raw = await readTextAny(ctx, p)
+        const txt = safeText(raw).trim()
+        if (!txt) continue
+        let block = tryText(txt)
+        // 如果文件名已明显对应当前章，但正文没有“第X章”标记，则按“整文件即本章大纲”兜底一次
+        if (!block) {
+          const bn = fsBaseName(p)
+          const score = _ainOutlineScoreFileNameForChapter(bn, base.chapNo, base.chapZh)
+          if (score <= 1) block = sliceHeadTail(txt, 3200, 0.55).trim()
+        }
+        if (block) return { info: base, source: p, text: block }
+      } catch {}
+    }
+  }
+
+  // 旧项目：单文件
+  for (let i = 0; i < OUTLINE_FILES.length; i++) {
+    const p = joinFsPath(base.projectAbs, OUTLINE_FILES[i])
+    try {
+      const raw = await readTextAny(ctx, p)
+      const txt = safeText(raw).trim()
+      if (!txt) continue
+      const block = tryText(txt)
+      if (block) return { info: base, source: p, text: block }
+    } catch {}
+  }
+
+  if (strict) {
+    const chap = base.volNo > 0 ? (t('第', 'Vol ') + String(base.volNo) + t('卷 第', ' Ch ') + String(base.chapNo) + t('章', '')) : (t('第', 'Ch ') + String(base.chapNo) + t('章', ''))
+    throw new Error(t(
+      `严格大纲模式：未匹配到当前章大纲（${chap}）。请在 05_章节大纲.md（或目录 05_章节大纲/）中按以下任一格式写：\n- 第${base.chapNo}章：……\n## 第${base.chapNo}章\n（直到下一个“第X章”）`,
+      `Strict outline: cannot find outline for ${chap}. Add it in 05_章节大纲.md (or 05_章节大纲/) using:\n- Chapter ${base.chapNo}: ...\n## Chapter ${base.chapNo}\n(until next Chapter ...)`
+    ))
+  }
+  return null
+}
+
+async function _ainMaybePrefixInstructionWithStrictOutline(ctx, cfg, instruction, opt) {
+  const inst = safeText(instruction).trim()
+  if (!inst) return inst
+  const o = (opt && typeof opt === 'object') ? opt : {}
+  const strict = _ainOutlineIsStrictEnabled(cfg, o.strict)
+  if (!strict) return inst
+  if (/【本章大纲（必须严格遵循）】/u.test(inst)) return inst
+
+  const infoOverride = (o.chapterInfo && typeof o.chapterInfo === 'object') ? o.chapterInfo : null
+  const found = infoOverride
+    ? await _ainFindOutlineForChapter(ctx, cfg, infoOverride, true)
+    : await _ainFindOutlineForCurrentChapter(ctx, cfg, true)
+  if (!found || !found.text) return inst
+
+  const info = found.info
+  const chapLabel = (info && info.volNo > 0)
+    ? (`第${info.volNo}卷 第${info.chapNo}章`)
+    : (`第${info.chapNo}章`)
+
+  const prefix = [
+    '【本章大纲（必须严格遵循）】',
+    `章节：${chapLabel}`,
+    found && found.source ? (`来源：${safeText(found.source).trim()}`) : '',
+    '',
+    safeText(found.text).trim(),
+    '',
+    '【硬规则】',
+    '- 必须严格按大纲推进剧情：关键事件顺序不得擅自改写/跳过。',
+    '- 允许扩写细节与表现，但不得新增主线或改变大纲含义。',
+    '- 若大纲有空缺/不清晰：宁可写得保守，不要自作主张改剧情。'
+  ].filter(Boolean).join('\n').trim()
+
+  return prefix + '\n\n' + inst
 }
 
 function _ainGlobalHardConstraintsDocTemplate() {
@@ -4270,6 +4589,22 @@ async function openSettingsDialog(ctx) {
   lblStrict.appendChild(document.createTextNode(t('严格人物状态', 'Strict char state')))
   rowConstraintMode.appendChild(lblStrict)
 
+  const lblStrictOutline = document.createElement('label')
+  lblStrictOutline.style.display = 'flex'
+  lblStrictOutline.style.gap = '6px'
+  lblStrictOutline.style.alignItems = 'center'
+  lblStrictOutline.style.cursor = 'pointer'
+  lblStrictOutline.title = t(
+    '启用后，续写/候选必须严格按“章节大纲”执行；若无法匹配到当前章大纲则拒绝生成（避免剧情跑偏）',
+    'When enabled, writing/options must follow the chapter outline; if current chapter outline is not found, generation is blocked.'
+  )
+  const cbStrictOutline = document.createElement('input')
+  cbStrictOutline.type = 'checkbox'
+  cbStrictOutline.checked = !!(cfg && cfg.outline && cfg.outline.strict)
+  lblStrictOutline.appendChild(cbStrictOutline)
+  lblStrictOutline.appendChild(document.createTextNode(t('严格遵循章节大纲（缺失则拒绝写作）', 'Strict outline (block if missing)')))
+  rowConstraintMode.appendChild(lblStrictOutline)
+
   const constraintModeHint = document.createElement('div')
   constraintModeHint.className = 'ain-muted'
   constraintModeHint.style.fontSize = '12px'
@@ -4281,6 +4616,16 @@ async function openSettingsDialog(ctx) {
 
   secCtx.appendChild(rowConstraintMode)
   secCtx.appendChild(constraintModeHint)
+
+  const strictOutlineHint = document.createElement('div')
+  strictOutlineHint.className = 'ain-muted'
+  strictOutlineHint.style.fontSize = '12px'
+  strictOutlineHint.style.marginTop = '4px'
+  strictOutlineHint.textContent = t(
+    '提示：严格大纲模式要求“当前打开的文件”是章节文件（位于 03_章节/ 下，文件名形如 001_第一章.md），并且在 05_章节大纲.md（或 05_章节大纲/）中能匹配到对应章条目。',
+    'Tip: Strict outline requires the current file to be a chapter file under 03_章节/ (e.g. 001_第一章.md) and the outline must contain a matching entry in 05_章节大纲.md (or 05_章节大纲/).'
+  )
+  secCtx.appendChild(strictOutlineHint)
 
   function applyCtxPreset(totalChars) {
     const total = _clampInt(totalChars, 8000, 10000000)
@@ -4891,6 +5236,9 @@ async function openSettingsDialog(ctx) {
           global: safeText(hard.ta.value).trim(),
           creativeExemption: !!cbCreativeExemption.checked,
           strictCharState: !!cbStrictCharState.checked
+        },
+        outline: {
+          strict: !!cbStrictOutline.checked
         },
         agent: {
           enabled: !!cbAgent.checked,
@@ -5575,13 +5923,16 @@ async function openNextOptionsDialog(ctx) {
     lastTitleHint = safeText(chosen && chosen.title ? chosen.title : '').trim()
 
     cfg = await loadCfg(ctx)
-    const instruction = safeText(inp.ta.value).trim()
+    let instruction = safeText(inp.ta.value).trim()
     const localConstraints = safeText(extra.ta.value).trim()
     const constraints = _ainAppendWritingStyleHintToConstraints(await mergeConstraintsWithCharState(ctx, cfg, localConstraints))
     if (!instruction) {
       ctx.ui.notice(t('请先写一句“指令/目标”', 'Please provide instruction/goal'), 'err', 1800)
       return
     }
+
+    // 严格大纲模式：把本章大纲注入到 instruction（避免被预算裁剪）
+    instruction = await _ainMaybePrefixInstructionWithStrictOutline(ctx, cfg, instruction, { strict: undefined })
 
     const prev = await getPrevTextForRequest(ctx, cfg)
     const progress = await getProgressDocText(ctx, cfg)
@@ -5793,6 +6144,29 @@ async function openWriteWithChoiceDialog(ctx) {
     ''
   )
   sec.appendChild(extra.wrap)
+
+  // 严格大纲：这是用户真实工作流，不是“让模型自由发挥”的玩具
+  const strictOutlineLine = document.createElement('label')
+  strictOutlineLine.style.display = 'flex'
+  strictOutlineLine.style.gap = '8px'
+  strictOutlineLine.style.alignItems = 'center'
+  strictOutlineLine.style.marginTop = '6px'
+  const cbStrictOutline = document.createElement('input')
+  cbStrictOutline.type = 'checkbox'
+  cbStrictOutline.checked = _ainOutlineIsStrictEnabled(cfg)
+  cbStrictOutline.onchange = async () => {
+    try { cfg = await saveCfg(ctx, { outline: { strict: !!cbStrictOutline.checked } }) } catch {}
+  }
+  strictOutlineLine.appendChild(cbStrictOutline)
+  strictOutlineLine.appendChild(document.createTextNode(t('严格遵循章节大纲（缺失则拒绝写作）', 'Strict outline (block if missing)')))
+  sec.appendChild(strictOutlineLine)
+  const strictOutlineHint = document.createElement('div')
+  strictOutlineHint.className = 'ain-muted'
+  strictOutlineHint.textContent = t(
+    '说明：开启后将按当前章节号从 05_章节大纲.md（或 05_章节大纲/）提取本章大纲并强制遵循；找不到就直接报错，避免跑偏。',
+    'Note: when enabled, extracts current chapter outline from 05_章节大纲.md (or 05_章节大纲/) and enforces it; if not found, generation fails to prevent drift.'
+  )
+  sec.appendChild(strictOutlineHint)
 
   const rowGlobalHard = mkBtnRow()
   const btnWriteGlobalHard = document.createElement('button')
@@ -7492,9 +7866,12 @@ async function openWriteWithChoiceDialog(ctx) {
     lastTitleHint = safeText(chosen && chosen.title ? chosen.title : '').trim()
 
     cfg = await loadCfg(ctx)
-    const instruction = ensureInstruction(getInstructionText(), t('按选中走向续写本章', 'Write with the selected option'))
+    let instruction = ensureInstruction(getInstructionText(), t('按选中走向续写本章', 'Write with the selected option'))
     const localConstraints = getLocalConstraintsText()
     const constraints = _ainAppendWritingStyleHintToConstraints(await mergeConstraintsWithCharState(ctx, cfg, localConstraints))
+
+    // 严格大纲模式：把本章大纲注入到 instruction（避免被预算裁剪）
+    instruction = await _ainMaybePrefixInstructionWithStrictOutline(ctx, cfg, instruction, { strict: undefined })
 
     const prev = await getPrevTextForRequest(ctx, cfg)
     const progress = await getProgressDocText(ctx, cfg)
@@ -7650,7 +8027,8 @@ async function openWriteWithChoiceDialog(ctx) {
 
   async function doWriteDirect() {
     cfg = await loadCfg(ctx)
-    const instruction = getInstructionText()
+    const instructionRaw = getInstructionText()
+    let instruction = safeText(instructionRaw).trim()
     lastTitleHint = ''
     const localConstraints = getLocalConstraintsText()
     const constraints = _ainAppendWritingStyleHintToConstraints(await mergeConstraintsWithCharState(ctx, cfg, localConstraints))
@@ -7658,6 +8036,9 @@ async function openWriteWithChoiceDialog(ctx) {
       ctx.ui.notice(t('请先写清楚“本章目标/要求”', 'Please provide instruction/goal'), 'err', 2000)
       return
     }
+
+    // 严格大纲模式：把本章大纲注入到 instruction（避免被预算裁剪）
+    instruction = await _ainMaybePrefixInstructionWithStrictOutline(ctx, cfg, instruction, { strict: undefined })
 
     const prev = await getPrevTextForRequest(ctx, cfg)
     const progress = await getProgressDocText(ctx, cfg)
@@ -7720,7 +8101,7 @@ async function openWriteWithChoiceDialog(ctx) {
             progress,
             bible,
             prev,
-            choice: makeDirectChoice(instruction),
+            choice: makeDirectChoice(instructionRaw),
             constraints: constraints || undefined,
             rag: rag || undefined
           }, { mode: 'write' })
@@ -7728,7 +8109,7 @@ async function openWriteWithChoiceDialog(ctx) {
         } catch {}
         const res = await agentRunPlan(ctx, cfg, {
           instruction: instruction2,
-          choice: makeDirectChoice(instruction),
+          choice: makeDirectChoice(instructionRaw),
           constraints: constraints || '',
           prev,
           progress,
@@ -7771,7 +8152,7 @@ async function openWriteWithChoiceDialog(ctx) {
         progress,
         bible,
         prev,
-        choice: makeDirectChoice(instruction),
+        choice: makeDirectChoice(instructionRaw),
         constraints: constraints || undefined,
         rag: rag || undefined
       }
@@ -8023,6 +8404,21 @@ async function openAutoWriteDialog(ctx) {
   )
   sec.appendChild(inpExtra.wrap)
 
+  const strictOutlineLine = document.createElement('label')
+  strictOutlineLine.style.display = 'flex'
+  strictOutlineLine.style.gap = '8px'
+  strictOutlineLine.style.alignItems = 'center'
+  strictOutlineLine.style.marginTop = '6px'
+  const cbStrictOutline = document.createElement('input')
+  cbStrictOutline.type = 'checkbox'
+  cbStrictOutline.checked = _ainOutlineIsStrictEnabled(cfg)
+  cbStrictOutline.onchange = async () => {
+    try { cfg = await saveCfg(ctx, { outline: { strict: !!cbStrictOutline.checked } }) } catch {}
+  }
+  strictOutlineLine.appendChild(cbStrictOutline)
+  strictOutlineLine.appendChild(document.createTextNode(t('严格遵循章节大纲（缺失则拒绝写作）', 'Strict outline (block if missing)')))
+  sec.appendChild(strictOutlineLine)
+
   const rowGlobalHard = mkBtnRow()
   const btnWriteGlobalHard = document.createElement('button')
   btnWriteGlobalHard.className = 'ain-btn gray'
@@ -8190,10 +8586,21 @@ async function openAutoWriteDialog(ctx) {
           '请基于【进度脉络】【资料/圣经】【前文尾部】自动决定本章走向并续写正文。只输出正文，不要标题，不要分析，不要列候选。',
           'Based on context, decide the arc and continue the prose. Output prose only (no title, no analysis, no options).'
         )
-        const inst = baseIns + '\n\n' + t(
+        const inst0 = baseIns + '\n\n' + t(
           `（全自动续写：第 ${i + 1}/${chapters} 章）`,
           `(Auto-write: chapter ${i + 1}/${chapters})`
         )
+
+        // 严格大纲模式：全自动续写没有“打开目标章节文件”的前提，必须显式用目标章节号去匹配大纲
+        let inst = inst0
+        try {
+          const volNo = parseVolumeNoFromDirName(fsBaseName(inf.chapDir))
+          const outlineInfo = { projectAbs: inf.projectAbs, chapNo: inf.chapNo, chapZh: inf.chapZh, volNo, volZh: volNo > 0 ? zhNumber(volNo) : '' }
+          inst = await _ainMaybePrefixInstructionWithStrictOutline(ctx, cfg, inst0, { chapterInfo: outlineInfo })
+        } catch (e) {
+          // 严格模式下这里会抛错并终止；非严格模式下兜底不影响主流程
+          if (_ainOutlineIsStrictEnabled(cfg)) throw e
+        }
 
         const constraints = _ainAppendWritingStyleHintToConstraints(await mergeConstraintsWithCharState(ctx, cfg, localConstraints))
         const prev = await getPrevTextForRequest(ctx, cfg)
@@ -8211,7 +8618,7 @@ async function openAutoWriteDialog(ctx) {
           progress,
           bible,
           prev,
-          choice: _ainAutoWriteMakeChoice(inst),
+          choice: _ainAutoWriteMakeChoice(inst0),
           constraints: constraints || undefined,
           rag: rag || undefined
         }
@@ -8310,6 +8717,11 @@ async function callNovel(ctx, action, instructionOverride, constraintsOverride) 
   }
   instruction = instruction.trim()
   if (!instruction) return null
+
+  // 严格大纲模式：options 也必须按本章大纲给候选，否则后续必跑偏
+  if (action === 'options' || action === 'write') {
+    instruction = await _ainMaybePrefixInstructionWithStrictOutline(ctx, cfg, instruction, { strict: undefined })
+  }
   const prev = await getPrevTextForRequest(ctx, cfg)
   const progress = await getProgressDocText(ctx, cfg)
   const bible = await getBibleDocText(ctx, cfg)
@@ -9317,8 +9729,11 @@ async function agentRunPlan(ctx, cfg, base, ui) {
         it.status = 'done'
       } else if (it.type === 'write') {
         writeNo++
-        const instruction = safeText(it.instruction).trim() || safeText(base && base.instruction).trim()
+        let instruction = safeText(it.instruction).trim() || safeText(base && base.instruction).trim()
         if (!instruction) throw new Error(t('instruction 为空', 'Empty instruction'))
+
+        // 严格大纲模式：Agent 写作也必须按本章大纲（否则分段越写越歪）
+        instruction = await _ainMaybePrefixInstructionWithStrictOutline(ctx, cfg, instruction, { strict: undefined })
         const prevFull = curPrev()
         // 分段续写：只喂“尾巴”，减少模型回头重写的诱因；同时把分段信息传给后端做增量约束（不影响非 Agent）。
         const prev = writeNo > 1 ? sliceTail(prevFull, 2400) : prevFull
@@ -11581,6 +11996,31 @@ async function openBootstrapDialog(ctx) {
   out.textContent = t('输出会显示在这里。', 'Output will appear here.')
   sec.appendChild(out)
 
+  // 创建成功后的“下一步”入口：只在完成页显示（避免菜单里到处塞按钮）
+  const postCreate = document.createElement('div')
+  postCreate.className = 'ain-card'
+  postCreate.style.marginTop = '10px'
+  postCreate.style.display = 'none'
+  postCreate.innerHTML = `<div style="font-weight:700;margin-bottom:6px">${t('下一步', 'Next steps')}</div>`
+
+  const postRow = mkBtnRow()
+  const btnGenChap1 = document.createElement('button')
+  btnGenChap1.className = 'ain-btn'
+  btnGenChap1.textContent = t('生成第一章（创建并打开）', 'Generate Chapter 1 (create & open)')
+  btnGenChap1.disabled = true
+  postRow.appendChild(btnGenChap1)
+  postCreate.appendChild(postRow)
+
+  const postHint = document.createElement('div')
+  postHint.className = 'ain-muted'
+  postHint.textContent = t(
+    '提示：你也可以把世界设定拆成目录“02_世界设定/”（推荐放一个 00_摘要.md），把章节大纲拆成目录“05_章节大纲/”。开启“严格遵循章节大纲”后，若无法匹配到当前章大纲会拒绝续写（避免跑偏）。',
+    'Tip: You can split world settings into 02_世界设定/ (recommended: 00_摘要.md) and outline into 05_章节大纲/. With Strict outline enabled, writing will be blocked if current chapter outline is not found.'
+  )
+  postCreate.appendChild(postHint)
+
+  sec.appendChild(postCreate)
+
   const follow = document.createElement('div')
   follow.className = 'ain-card'
   follow.innerHTML = `<div style="font-weight:700;margin-bottom:6px">${t('补充回答（可多轮）', 'Follow-up (multi-round)')}</div>`
@@ -11603,6 +12043,25 @@ async function openBootstrapDialog(ctx) {
   rowFollow.appendChild(btnContinue)
   follow.appendChild(rowFollow)
   sec.appendChild(follow)
+
+  const dirModeLine = document.createElement('label')
+  dirModeLine.style.display = 'flex'
+  dirModeLine.style.gap = '8px'
+  dirModeLine.style.alignItems = 'center'
+  dirModeLine.style.marginTop = '10px'
+  const cbMetaDirs = document.createElement('input')
+  cbMetaDirs.type = 'checkbox'
+  cbMetaDirs.checked = false
+  dirModeLine.appendChild(cbMetaDirs)
+  dirModeLine.appendChild(document.createTextNode(t('世界设定/章节大纲使用文件夹结构（写入 00_摘要.md）', 'Use folder structure for World/Outline (write to 00_摘要.md)')))
+  sec.appendChild(dirModeLine)
+  const dirModeHint = document.createElement('div')
+  dirModeHint.className = 'ain-muted'
+  dirModeHint.textContent = t(
+    '说明：勾选后会写入 02_世界设定/00_摘要.md 与 05_章节大纲/00_摘要.md，方便你后续拆分/复用设定。未勾选则写入单文件（兼容旧项目）。',
+    'Note: when enabled, writes 02_世界设定/00_摘要.md and 05_章节大纲/00_摘要.md for easier reuse; otherwise uses single files (legacy compatible).'
+  )
+  sec.appendChild(dirModeHint)
 
   const world = mkTextarea(t('世界设定（规则/地点/阵营等，可空）', 'World settings (optional)'), '')
   sec.appendChild(world.wrap)
@@ -11797,10 +12256,23 @@ async function openBootstrapDialog(ctx) {
     await writeTextAny(ctx, joinFsPath(projectAbs, '00_项目.md'), metaMd)
     await writeTextAny(ctx, joinFsPath(projectAbs, '.ainovel/meta.json'), JSON.stringify(meta, null, 2))
     await writeTextAny(ctx, joinFsPath(projectAbs, '01_进度脉络.md'), t('# 进度脉络\n\n- （从这里开始记录主线/时间线/人物状态/伏笔）\n', '# Progress\n\n- (Track plot/timeline/characters/foreshadowing here)\n'))
-    await writeTextAny(ctx, joinFsPath(projectAbs, '02_世界设定.md'), safeText(world.ta.value).trim() || t('# 世界设定\n\n- 规则：\n- 地点：\n- 阵营：\n', '# World\n\n- Rules:\n- Places:\n- Factions:\n'))
+
+    const worldText = safeText(world.ta.value).trim() || t('# 世界设定\n\n- 规则：\n- 地点：\n- 阵营：\n', '# World\n\n- Rules:\n- Places:\n- Factions:\n')
+    const outlineText = safeText(outline.ta.value).trim() || t('# 章节大纲\n\n- 第 1 章：\n- 第 2 章：\n', '# Outline\n\n- Chapter 1:\n- Chapter 2:\n')
+    const useDir = !!cbMetaDirs.checked
+
+    if (useDir) {
+      await writeTextAny(ctx, joinFsPath(projectAbs, '02_世界设定/00_摘要.md'), worldText)
+    } else {
+      await writeTextAny(ctx, joinFsPath(projectAbs, '02_世界设定.md'), worldText)
+    }
     await writeTextAny(ctx, joinFsPath(projectAbs, '03_主要角色.md'), safeText(chars.ta.value).trim() || t('# 主要角色\n\n- 角色名：性格/动机/当前状态\n', '# Characters\n\n- Name: traits/motivation/status\n'))
     await writeTextAny(ctx, joinFsPath(projectAbs, '04_人物关系.md'), safeText(rels.ta.value).trim() || t('# 人物关系\n\n- A ↔ B：关系/矛盾/利益\n', '# Relations\n\n- A ↔ B: relation/conflict/stakes\n'))
-    await writeTextAny(ctx, joinFsPath(projectAbs, '05_章节大纲.md'), safeText(outline.ta.value).trim() || t('# 章节大纲\n\n- 第 1 章：\n- 第 2 章：\n', '# Outline\n\n- Chapter 1:\n- Chapter 2:\n'))
+    if (useDir) {
+      await writeTextAny(ctx, joinFsPath(projectAbs, '05_章节大纲/00_摘要.md'), outlineText)
+    } else {
+      await writeTextAny(ctx, joinFsPath(projectAbs, '05_章节大纲.md'), outlineText)
+    }
     await writeTextAny(ctx, joinFsPath(projectAbs, '06_人物状态.md'), t('# 人物状态\n\n- （自动维护：每次更新会追加一个“快照”，用于续写上下文）\n', '# Character states\n\n- (Auto-maintained snapshots for writing context)\n'))
     await writeTextAny(ctx, joinFsPath(projectAbs, AIN_GLOBAL_HARD_CONSTRAINTS_FILE), _ainGlobalHardConstraintsDocTemplate())
     await writeTextAny(ctx, joinFsPath(projectAbs, '.ainovel/index.json'), JSON.stringify({ version: 1, created_at: now }, null, 2))
@@ -11816,8 +12288,30 @@ async function openBootstrapDialog(ctx) {
       }
     } catch {}
 
-    out.textContent = t('已创建项目并写入文件：', 'Project created: ') + projectRel
-    ctx.ui.notice(t('已创建项目：请用“开始下一章”或“新开一卷”开始写作', 'Project created: use Start next chapter or Start new volume'), 'ok', 2800)
+    out.textContent = [
+      t('已创建项目并写入文件：', 'Project created: ') + projectRel,
+      '',
+      t('下一步：点击下方“生成第一章（创建并打开）”。', 'Next: click “Generate Chapter 1 (create & open)”.'),
+      '',
+      t('提示：你可以把世界设定拆成目录“02_世界设定/”（推荐放一个 00_摘要.md）。', 'Tip: split world settings into 02_世界设定/ (recommended: 00_摘要.md).'),
+      t('提示：你可以把章节大纲拆成目录“05_章节大纲/”。开启严格大纲后，未匹配到本章大纲会拒绝续写。', 'Tip: split outline into 05_章节大纲/. With strict outline, writing is blocked if current chapter outline is missing.')
+    ].join('\n')
+
+    // 完成页按钮：生成第一章（不进菜单）
+    try {
+      postCreate.style.display = ''
+      btnGenChap1.disabled = false
+      btnGenChap1.onclick = () => {
+        void (async () => {
+          let cfg2 = await loadCfg(ctx)
+          await novel_create_next_chapter_impl(ctx, cfg2, { confirm: false, updateMeta: false, showNotices: true })
+        })().catch((e) => {
+          ctx.ui.notice(t('失败：', 'Failed: ') + (e && e.message ? e.message : String(e)), 'err', 2600)
+        })
+      }
+    } catch {}
+
+    ctx.ui.notice(t('已创建项目：请在本页生成第一章后开始写作', 'Project created: generate Chapter 1 here to start writing'), 'ok', 2800)
   }
 
   btnAppend.onclick = () => {
