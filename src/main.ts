@@ -9439,17 +9439,10 @@ function bindEvents() {
       if (!p) return
       if (e.key === 'F2') {
         e.preventDefault()
-        const base = p.replace(/[\\/][^\\/]*$/, '')
-        const oldName = p.split(/[\\/]+/).pop() || ''
-        const name = window.prompt('重命名为：', oldName) || ''
-        if (!name || name === oldName) return
-        const root = await getLibraryRoot(); if (!root) return
+        const root = await getLibraryRoot()
+        if (!root) return
         if (!isInside(root, p)) { alert('越权操作禁止'); return }
-        const dst = base + (base.includes('\\') ? '\\' : '/') + name
-        if (await exists(dst)) { alert('同名已存在'); return }
-        await moveFileSafe(p, dst)
-        if (currentFilePath === p) { currentFilePath = dst as any; refreshTitle() }
-      const treeEl = document.getElementById('lib-tree') as HTMLDivElement | null; if (treeEl && !fileTreeReady) { await fileTree.init(treeEl, { getRoot: getLibraryRoot, onOpenFile: async (p: string) => { await openFile2(p) }, onOpenNewFile: async (p: string) => { await openFile2(p); mode='edit'; preview.classList.add('hidden'); try { (editor as HTMLTextAreaElement).focus() } catch {} }, onMoved: async (src: string, dst: string) => { try { if (currentFilePath === src) { currentFilePath = dst as any; refreshTitle() } } catch {} } }); fileTreeReady = true } else if (treeEl) { await fileTree.refresh() }
+        await renamePathWithDialog(p)
         return
       }
       // Delete 键删除文件功能已移除，避免干扰编辑器中的文字删除
