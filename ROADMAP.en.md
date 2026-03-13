@@ -2,6 +2,12 @@
 
 [简体中文](ROADMAP.md) | [English](ROADMAP.en.md)
 
+## Update v1.3.4
+- Added: Source mode now shows a left-side line-number gutter that stays in sync with scrolling and highlights the current line
+- Improved: Windows installers now use a dedicated icon for associated documents instead of reusing the app icon
+- Improved: Windows file associations now use FlyMD-owned ProgIDs such as `flymd.markdown` / `flymd.pdf`, avoiding collisions with generic system type names
+- Docs: README now credits the file icon designer
+
 ## Update v1.3.3
 - Fixed: Sticky Note auto-resize could jitter under multi-monitor/mixed display scaling, and the button area could cover content when the note grows
 - Improved: Sticky Note height measurement waits one frame to reduce layout jitter on some devices
