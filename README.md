@@ -374,6 +374,15 @@ FlyMD 拥有丰富的插件生态,支持通过扩展插件无限扩展功能。
 	  </tr>
 	  <tr>
 	    <td align="center">
+	      <a href="https://github.com/afoovo">
+	        <img src="https://github.com/afoovo.png" width="40" alt="afoovo 头像" /><br />
+	        <sub><b>afoovo</b></sub>
+	      </a>
+	    </td>
+	    <td>翻译选中文本插件</td>
+	  </tr>
+	  <tr>
+	    <td align="center">
 	      <a href="https://github.com/gerrampard">
 	        <img src="https://github.com/gerrampard.png" width="40" alt="gerrampard 头像" /><br />
 	        <sub><b>gerrampard</b></sub>

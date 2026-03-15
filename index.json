@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-01-30T00:00:00Z",
+  "updatedAt": "2026-03-15T00:00:00Z",
   "ttlSeconds": 3600,
   "items": [
     {
@@ -399,6 +399,18 @@
       "install": {
         "ref": "https://raw.githubusercontent.com/flyhunterl/flymd/main/public/plugins/flymd-RAG/manifest.json",
         "type": "manifest"
+      }
+    },
+    {
+      "homepage": "https://github.com/afoovo/flymd-translate-selection",
+      "name": "翻译选中文本",
+      "description": "选中文本后显示按钮或右键菜单，一键翻译选中的内容。",
+      "author": "afo",
+      "id": "flymd-translate-selection",
+      "category": "编辑增强",
+      "install": {
+        "ref": "afoovo/flymd-translate-selection@master",
+        "type": "github"
       }
     },
     {

@@ -357,6 +357,15 @@ Stay connected for the latest updates, preview builds, and tips:
   </tr>
   <tr>
     <td align="center">
+      <a href="https://github.com/afoovo">
+        <img src="https://github.com/afoovo.png" width="40" alt="afoovo avatar" /><br />
+        <sub><b>afoovo</b></sub>
+      </a>
+    </td>
+    <td>Translate selected text plugin</td>
+  </tr>
+  <tr>
+    <td align="center">
       <a href="https://github.com/gerrampard">
         <img src="https://github.com/gerrampard.png" width="40" alt="gerrampard avatar" /><br />
         <sub><b>gerrampard</b></sub>
