@@ -2,6 +2,11 @@
 
 [简体中文](ROADMAP.md) | [English](ROADMAP.en.md)
 
+## Update v1.3.6
+- Fixed: Local document links in Preview now resolve and open relative targets correctly, covering `md` / `markdown` / `txt` / `pdf` files as well as `file://`, drive-letter, and UNC path cases
+- Fixed: Source mode Tab / Shift+Tab indentation behavior has been unified across caret, single-line selection, and multi-line selection, with compatibility for legacy indent tokens and raw tab characters
+- Fixed: Maximize/restore button state now follows the real window state, making the titlebar controls more reliable in both the main window and Focus mode
+
 ## Update v1.3.5
 - Improved: Startup has been slimmed down again. The main window now appears after the first frame is ready, while non-critical modules such as tabs, split view, line numbers, library resize, and the theme panel are deferred for a faster, steadier launch
 - Fixed: In Source mode, `*` and backtick completion is now handled immediately, removing input lag; single/double/triple backtick wrapping and fenced-code generation respond more directly
