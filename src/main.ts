@@ -3552,12 +3552,17 @@ function refreshTitle() {
 
 // 更新状态栏（行列字）
 function refreshStatus() {
-  const pos = editor.selectionStart
-  const until = editor.value.slice(0, pos)
-  const lines = until.split(/\n/)
-  const row = lines.length
-  const col = (lines[lines.length - 1] || '').length + 1
-  const chars = editor.value.length
+  const pos = editor.selectionStart >>> 0
+  const fastInfo = (() => {
+    try {
+      return (window as any).flymdGetSourceEditorPositionInfo?.(pos) || null
+    } catch {
+      return null
+    }
+  })()
+  const row = fastInfo?.row ?? 1
+  const col = fastInfo?.col ?? 1
+  const chars = fastInfo?.chars ?? editor.value.length
   status.textContent = fmtStatus(row, col) + `, 字 ${chars}`
 }
 
@@ -5655,8 +5660,19 @@ function renderOutlinePanel() {
       })
     } else {
       // 退化：从源码扫描 # 标题行
-      const src = editor?.value || ''
-      const lines = src.split(/\n/)
+      const sourceSnapshot = (() => {
+        try {
+          return (window as any).flymdGetSourceEditorLinesSnapshot?.() || null
+        } catch {
+          return null
+        }
+      })()
+      const lines = Array.isArray(sourceSnapshot?.lines)
+        ? (sourceSnapshot.lines as string[])
+        : String(editor?.value || '').split(/\n/)
+      const lineStarts = Array.isArray(sourceSnapshot?.lineStarts)
+        ? (sourceSnapshot.lineStarts as number[])
+        : null
       let offset = 0
       lines.forEach((ln, i) => {
         const m = ln.match(/^(#{1,6})\s+(.+?)\s*$/)
@@ -5665,10 +5681,10 @@ function renderOutlinePanel() {
           const text = m[2].trim()
           const id = slug(text + '-' + i)
           // 记录标题在源码中的大致字符偏移，用于源码模式下跳转
-          items.push({ level, id, text, offset })
+          items.push({ level, id, text, offset: lineStarts?.[i] ?? offset })
         }
         // \n 按单字符累计；Windows 下的 \r\n 中 \r 已在 ln 末尾
-        offset += ln.length + 1
+        if (!lineStarts) offset += ln.length + 1
       })
     }
 
@@ -9751,8 +9767,8 @@ function bindEvents() {
   editor.addEventListener('input', () => { scheduleSaveDocPos() })
   editor.addEventListener('compositionend', () => { scheduleSaveDocPos() })
   editor.addEventListener('scroll', () => { scheduleSaveDocPos() })
-  editor.addEventListener('keyup', () => { scheduleSaveDocPos(); try { notifySelectionChangeForPlugins() } catch {} })
-  editor.addEventListener('click', () => { scheduleSaveDocPos(); try { notifySelectionChangeForPlugins() } catch {} })
+  editor.addEventListener('keyup', () => { scheduleSaveDocPos() })
+  editor.addEventListener('click', () => { scheduleSaveDocPos() })
   // 便签模式：失焦时强制落盘，避免“改完就关窗口”撞上防抖窗口期
   editor.addEventListener('blur', () => { try { void _stickyAutoSaver.flush() } catch {} })
 
@@ -9760,7 +9776,8 @@ function bindEvents() {
   try {
     let wasNearBottomBeforeInput = false
     let raf = 0
-    const getLineHeightPx = (): number => {
+    let cachedLineHeightPx = 0
+    const refreshLineHeightPx = (): number => {
       try {
         const style = window.getComputedStyle(editor)
         let lh = parseFloat(style.lineHeight || '')
@@ -9768,8 +9785,15 @@ function bindEvents() {
           const fs = parseFloat(style.fontSize || '16') || 16
           lh = fs * 1.6
         }
+        cachedLineHeightPx = lh
         return lh
-      } catch { return 24 }
+      } catch {
+        cachedLineHeightPx = 24
+        return 24
+      }
+    }
+    const getLineHeightPx = (): number => {
+      return cachedLineHeightPx > 0 ? cachedLineHeightPx : refreshLineHeightPx()
     }
     const isNearBottom = (): boolean => {
       try {
@@ -9802,6 +9826,11 @@ function bindEvents() {
         })
       } catch {}
     }
+    refreshLineHeightPx()
+    window.addEventListener('resize', () => { refreshLineHeightPx() })
+    window.addEventListener('flymd:theme:changed', () => { refreshLineHeightPx() })
+    window.addEventListener('flymd:mode:changed', () => { refreshLineHeightPx() })
+    window.addEventListener('flymd:uiZoom:changed', () => { refreshLineHeightPx() })
     editor.addEventListener('beforeinput', () => { try { wasNearBottomBeforeInput = isNearBottom() } catch {} }, { passive: true } as any)
     editor.addEventListener('input', () => { try { stickToBottom() } catch {} }, { passive: true } as any)
     editor.addEventListener('compositionend', () => { try { stickToBottom() } catch {} }, { passive: true } as any)

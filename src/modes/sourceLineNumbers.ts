@@ -13,6 +13,13 @@ type LinePatch = {
   newLines: string[]
 }
 
+type InputPatchHint = {
+  startLine: number
+  oldLineCount: number
+  startLinePos: number
+  endLinePos: number
+}
+
 function px(value: string | null | undefined, fallback = 0): number {
   const parsed = Number.parseFloat(String(value || ''))
   return Number.isFinite(parsed) ? parsed : fallback
@@ -122,6 +129,37 @@ function createLinePatch(
   }
 }
 
+function createInputPatchHint(
+  lines: string[],
+  lineStarts: number[],
+  textLength: number,
+  startPos: number,
+  endPos: number,
+): InputPatchHint | null {
+  if (!lines.length || !lineStarts.length) return null
+  const safeStart = Math.max(0, Math.min(startPos >>> 0, textLength))
+  const safeEnd = Math.max(safeStart, Math.min(endPos >>> 0, textLength))
+  const startLine = findLineByPos(lineStarts, safeStart, textLength)
+  const endLine = findLineByPos(lineStarts, safeEnd, textLength)
+  return {
+    startLine,
+    oldLineCount: Math.max(1, endLine - startLine + 1),
+    startLinePos: lineStarts[startLine] ?? 0,
+    endLinePos: (lineStarts[endLine] ?? 0) + (lines[endLine]?.length ?? 0),
+  }
+}
+
+function createLinePatchFromHint(prevText: string, nextText: string, hint: InputPatchHint): LinePatch | null {
+  const tailLength = Math.max(0, prevText.length - hint.endLinePos)
+  const nextEndLinePos = Math.max(hint.startLinePos, nextText.length - tailLength)
+  if (nextEndLinePos < hint.startLinePos) return null
+  return {
+    startLine: hint.startLine,
+    oldLineCount: hint.oldLineCount,
+    newLines: splitLines(nextText.slice(hint.startLinePos, nextEndLinePos)),
+  }
+}
+
 function readMetrics(editor: HTMLTextAreaElement): Metrics {
   const style = window.getComputedStyle(editor)
   const paddingLeft = px(style.paddingLeft)
@@ -216,6 +254,40 @@ function setActiveRow(rowEls: HTMLDivElement[], nextRow: number, prevRow: number
   return safeRow
 }
 
+function hookEditorTextMutations(editor: HTMLTextAreaElement, onTextChanged: () => void): void {
+  try {
+    const valueDesc =
+      Object.getOwnPropertyDescriptor(Object.getPrototypeOf(editor), 'value')
+      || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')
+    if (valueDesc?.get && valueDesc?.set) {
+      const readValue = () => String(valueDesc.get!.call(editor) || '')
+      const writeValue = (next: string) => valueDesc.set!.call(editor, next)
+      Object.defineProperty(editor, 'value', {
+        configurable: true,
+        enumerable: valueDesc.enumerable ?? true,
+        get() {
+          return readValue()
+        },
+        set(next: string) {
+          const prev = readValue()
+          writeValue(next)
+          if (readValue() !== prev) onTextChanged()
+        },
+      })
+    }
+  } catch {}
+
+  try {
+    const originalSetRangeText = editor.setRangeText.bind(editor)
+    ;(editor as any).setRangeText = (...args: any[]) => {
+      const prev = String(editor.value || '')
+      const result = originalSetRangeText(...args)
+      if (String(editor.value || '') !== prev) onTextChanged()
+      return result
+    }
+  } catch {}
+}
+
 function installLineNumbers(): void {
   try {
     const container = document.querySelector('.container') as HTMLDivElement | null
@@ -267,7 +339,44 @@ function installLineNumbers(): void {
     let needsLayoutRefresh = true
     let raf = 0
     let lastGutterWidth = ''
-    let lastProbeText = String(editor.value || '')
+    let pendingInputPatch: InputPatchHint | null = null
+
+    flymd.flymdGetSourceEditorPositionInfo = (pos: number) => {
+      try {
+        const textLength = lastText.length >>> 0
+        const safePos = Math.max(0, Math.min(pos >>> 0, textLength))
+        const lineIndex = findLineByPos(lineStarts, safePos, textLength)
+        const lineStart = lineStarts[lineIndex] ?? 0
+        return {
+          row: lineIndex + 1,
+          col: Math.max(1, safePos - lineStart + 1),
+          chars: textLength,
+        }
+      } catch {
+        return null
+      }
+    }
+
+    flymd.flymdGetSourceEditorLineText = (lineNumber: number) => {
+      try {
+        const idx = Math.max(1, Math.floor(Number(lineNumber) || 1)) - 1
+        return lines[idx] ?? ''
+      } catch {
+        return ''
+      }
+    }
+
+    flymd.flymdGetSourceEditorLinesSnapshot = () => {
+      try {
+        return {
+          lines,
+          lineStarts,
+          chars: lastText.length >>> 0,
+        }
+      } catch {
+        return null
+      }
+    }
 
     const syncGutterWidth = () => {
       const digits = Math.max(2, String(Math.max(1, lines.length)).length)
@@ -310,13 +419,14 @@ function installLineNumbers(): void {
       remeasureRange(0, lines.length, metrics)
     }
 
-    const applyTextPatch = (text: string, metrics: Metrics) => {
+    const applyTextPatch = (text: string, metrics: Metrics, hint: InputPatchHint | null) => {
       if (!rowEls.length) {
         buildAllRows(metrics, text)
         remeasureAll(metrics)
         return
       }
-      const patch = createLinePatch(lastText, text, lines, lineStarts)
+      const patch = (hint ? createLinePatchFromHint(lastText, text, hint) : null)
+        || createLinePatch(lastText, text, lines, lineStarts)
       if (!patch) return
 
       const startLine = patch.startLine
@@ -376,9 +486,9 @@ function installLineNumbers(): void {
 
       const textChanged = needsTextRefresh || text !== lastText
       if (textChanged && currentMetrics) {
-        applyTextPatch(text, currentMetrics)
+        applyTextPatch(text, currentMetrics, pendingInputPatch)
+        pendingInputPatch = null
       }
-      lastProbeText = text
 
       const gutterWidthChanged = syncGutterWidth()
       const shouldRefreshLayout = needsLayoutRefresh || gutterWidthChanged || !lastMetricsKey
@@ -402,6 +512,44 @@ function installLineNumbers(): void {
       raf = window.requestAnimationFrame(flush)
     }
 
+    const scheduleExternalTextRefresh = () => {
+      pendingInputPatch = null
+      schedule('text')
+    }
+
+    const flushNowIfNeeded = () => {
+      const liveText = String(editor.value || '')
+      if (!currentMetrics) {
+        currentMetrics = readMetrics(editor)
+        buildAllRows(currentMetrics, liveText)
+        return
+      }
+      if (!raf && !needsLayoutRefresh && !needsTextRefresh && liveText === lastText) return
+      if (raf) {
+        try { window.cancelAnimationFrame(raf) } catch {}
+        raf = 0
+      }
+      flush()
+    }
+
+    const captureInputPatchHint = () => {
+      try {
+        flushNowIfNeeded()
+        pendingInputPatch = createInputPatchHint(
+          lines,
+          lineStarts,
+          lastText.length,
+          editor.selectionStart >>> 0,
+          editor.selectionEnd >>> 0,
+        )
+      } catch {
+        pendingInputPatch = null
+      }
+    }
+
+    hookEditorTextMutations(editor, () => scheduleExternalTextRefresh())
+
+    editor.addEventListener('beforeinput', () => captureInputPatchHint(), { passive: true } as any)
     editor.addEventListener('input', () => schedule('text'))
     editor.addEventListener('scroll', () => schedule('selection'))
     editor.addEventListener('click', () => schedule('selection'))
@@ -426,23 +574,12 @@ function installLineNumbers(): void {
     } catch {}
 
     try {
-      window.setInterval(() => {
-        if (!editor.isConnected) return
-        const now = String(editor.value || '')
-        if (now !== lastProbeText) {
-          lastProbeText = now
-          schedule('text')
-        }
-      }, 240)
-    } catch {}
-
-    try {
       if (!flymd.__lineNumbersPatchedOpenFile && typeof flymd.flymdOpenFile === 'function') {
         flymd.__lineNumbersPatchedOpenFile = true
         const original = flymd.flymdOpenFile
         flymd.flymdOpenFile = async (...args: any[]) => {
           const result = await original.apply(flymd, args)
-          schedule('text')
+          scheduleExternalTextRefresh()
           return result
         }
       }
@@ -454,7 +591,7 @@ function installLineNumbers(): void {
         const original = flymd.flymdNewFile
         flymd.flymdNewFile = async (...args: any[]) => {
           const result = await original.apply(flymd, args)
-          schedule('text')
+          scheduleExternalTextRefresh()
           return result
         }
       }

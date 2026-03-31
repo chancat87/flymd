@@ -93,6 +93,7 @@ export function applyUiZoom(): void {
       const label = document.getElementById('zoom-label') as HTMLSpanElement | null
       if (label) label.textContent = Math.round(scale * 100) + '%'
     } catch {}
+    try { window.dispatchEvent(new CustomEvent('flymd:uiZoom:changed', { detail: { scale, fontSize: base } })) } catch {}
   } catch {}
 }
 

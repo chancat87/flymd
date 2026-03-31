@@ -745,6 +745,14 @@ export function createPluginHost(
       try {
         const n = Number(lineNumber)
         if (!Number.isFinite(n)) return ''
+        const fast = (() => {
+          try {
+            return (window as any).flymdGetSourceEditorLineText?.(n)
+          } catch {
+            return null
+          }
+        })()
+        if (typeof fast === 'string') return fast
         const idx = Math.max(1, Math.floor(n)) - 1
         const lines = getSourceTextForPlugin().split(/\r?\n/)
         if (idx < 0 || idx >= lines.length) return ''
