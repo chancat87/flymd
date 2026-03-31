@@ -2,6 +2,12 @@
 
 [简体中文](ROADMAP.md) | [English](ROADMAP.en.md)
 
+## Update v1.3.7
+- Improved: Long-document performance in Source mode has been tightened again. High-frequency paths such as status-bar row/column calculation, title refresh, and source-outline scanning now reuse cached data, making typing and UI updates steadier on large files
+- Improved: Source line numbers now measure and render incrementally for the visible range instead of rebuilding the full gutter on every scroll, click, or selection change, which is much friendlier to very large documents
+- Added: Theme Settings now includes a `Source line numbers` toggle, so users can turn the gutter off when they want the lightest possible editing path
+- Improved: The IME fallback path now avoids full-document diff scans in normal cases, so paired completion stays more responsive in long-text Chinese input scenarios
+
 ## Update v1.3.6
 - Fixed: Local document links in Preview now resolve and open relative targets correctly, covering `md` / `markdown` / `txt` / `pdf` files as well as `file://`, drive-letter, and UNC path cases
 - Fixed: Source mode Tab / Shift+Tab indentation behavior has been unified across caret, single-line selection, and multi-line selection, with compatibility for legacy indent tokens and raw tab characters
