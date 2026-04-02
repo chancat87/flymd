@@ -968,7 +968,7 @@ body.dark-mode .editor-line-number.active {
   height: 100%;
   border: none; outline: none; resize: none;
   overflow-y: auto; /* 确保内容超出时显示滚动条 */
-  overflow-x: hidden; /* 隐藏横向滚动条 */
+  overflow-x: hidden; /* 隐藏横向滚动条，composing 期间 wrap=off 也不露出 */
   font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace);
   font-size: 16px; line-height: 1.7; color: var(--fg);
   background: var(--bg);
@@ -977,7 +977,9 @@ body.dark-mode .editor-line-number.active {
   --editor-pad-bottom: calc(40px + var(--scroll-past-end, 0px));
   padding: var(--editor-pad-top) var(--editor-pad-x) var(--editor-pad-bottom) var(--editor-pad-x);
   box-sizing: border-box;
-  letter-spacing: 0.01em;
+  letter-spacing: normal; /* 非零 letter-spacing 会禁用 Chromium 文本布局快速路径，显著影响大文本性能 */
+  text-rendering: optimizeSpeed; /* 跳过字距调整，提升大文本输入性能 */
+  font-kerning: none; /* 禁用字距对，减少文本整形开销 */
   /* 添加侧栏展开的过渡动画 */
   transition: padding-left 0.3s cubic-bezier(0.4, 0, 0.2, 1), padding-top 0.3s cubic-bezier(0.4, 0, 0.2, 1), padding-right 0.3s cubic-bezier(0.4, 0, 0.2, 1), padding-bottom 0.3s cubic-bezier(0.4, 0, 0.2, 1);
 }

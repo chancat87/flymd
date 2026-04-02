@@ -9793,11 +9793,14 @@ function bindEvents() {
   // 便签模式：失焦时强制落盘，避免“改完就关窗口”撞上防抖窗口期
   editor.addEventListener('blur', () => { try { void _stickyAutoSaver.flush() } catch {} })
 
-  // 接近底部输入时自动“吸底”，让文末留白自然生效（源码模式 + 旧所见共用 textarea）
+  // 接近底部输入时自动”吸底”，让文末留白自然生效（源码模式 + 旧所见共用 textarea）
   try {
     let wasNearBottomBeforeInput = false
     let raf = 0
     let cachedLineHeightPx = 0
+    let _stickyComposing = false
+    editor.addEventListener('compositionstart', () => { _stickyComposing = true }, { passive: true } as any)
+    editor.addEventListener('compositionend', () => { _stickyComposing = false }, { passive: true } as any)
     const refreshLineHeightPx = (): number => {
       try {
         const style = window.getComputedStyle(editor)
@@ -9852,8 +9855,9 @@ function bindEvents() {
     window.addEventListener('flymd:theme:changed', () => { refreshLineHeightPx() })
     window.addEventListener('flymd:mode:changed', () => { refreshLineHeightPx() })
     window.addEventListener('flymd:uiZoom:changed', () => { refreshLineHeightPx() })
-    editor.addEventListener('beforeinput', () => { try { wasNearBottomBeforeInput = isNearBottom() } catch {} }, { passive: true } as any)
-    editor.addEventListener('input', () => { try { stickToBottom() } catch {} }, { passive: true } as any)
+    // composing 期间跳过 scrollHeight 读取 — 每次读取都强制浏览器同步计算整个 textarea 的文本布局
+    editor.addEventListener('beforeinput', () => { try { if (!_stickyComposing) wasNearBottomBeforeInput = isNearBottom() } catch {} }, { passive: true } as any)
+    editor.addEventListener('input', () => { try { if (!_stickyComposing) stickToBottom() } catch {} }, { passive: true } as any)
     editor.addEventListener('compositionend', () => { try { stickToBottom() } catch {} }, { passive: true } as any)
   } catch {}
 
@@ -9898,8 +9902,23 @@ function bindEvents() {
     // 便签模式：内容一变就自动保存（防抖）
     try { _stickyAutoSaver.schedule() } catch {}
   })
-  editor.addEventListener('keyup', (ev) => { refreshStatus(ev); try { notifySelectionChangeForPlugins() } catch {} })
-  editor.addEventListener('click', (ev) => { refreshStatus(ev); try { notifySelectionChangeForPlugins() } catch {} })
+  // keyup / click 状态刷新：RAF 节流，避免每次击键同步读 DOM
+  {
+    let _statusRaf = 0
+    let _lastStatusEv: Event | undefined
+    const scheduleStatusRefresh = (ev: Event) => {
+      _lastStatusEv = ev
+      if (_statusRaf) return
+      _statusRaf = requestAnimationFrame(() => {
+        _statusRaf = 0
+        try { refreshStatus(_lastStatusEv) } catch {}
+        try { notifySelectionChangeForPlugins() } catch {}
+        _lastStatusEv = undefined
+      })
+    }
+    editor.addEventListener('keyup', scheduleStatusRefresh)
+    editor.addEventListener('click', scheduleStatusRefresh)
+  }
   // 粘贴到编辑器：
   // - Ctrl+Shift+V：始终按纯文本粘贴（忽略 HTML/图片等富文本信息）
   // - 普通 Ctrl+V：优先将 HTML 转译为 Markdown；其次处理图片文件占位+异步上传；否则走默认粘贴

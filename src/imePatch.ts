@@ -2,14 +2,27 @@
 (function () {
   try {
     const getEditor = (): HTMLTextAreaElement | null => document.getElementById('editor') as HTMLTextAreaElement | null
+
+    // 缓存 edit mode 状态，避免每次输入调用 getComputedStyle 导致强制布局
+    let _cachedEditMode = false
+    let _editModeDirty = true
+    const invalidateEditMode = () => { _editModeDirty = true }
     const isEditMode = (): boolean => {
+      if (!_editModeDirty) return _cachedEditMode
       try {
-        const ta = getEditor(); if (!ta) return false
+        const ta = getEditor(); if (!ta) { _cachedEditMode = false; _editModeDirty = false; return false }
         const style = window.getComputedStyle(ta)
         const visible = style && style.display !== 'none' && style.visibility !== 'hidden'
-        return visible && !ta.disabled
-      } catch { return false }
+        _cachedEditMode = visible && !ta.disabled
+        _editModeDirty = false
+        return _cachedEditMode
+      } catch { _cachedEditMode = false; _editModeDirty = false; return false }
     }
+    try {
+      window.addEventListener('flymd:mode:changed', invalidateEditMode)
+      window.addEventListener('flymd:wysiwygToggled', invalidateEditMode)
+      window.addEventListener('resize', invalidateEditMode)
+    } catch {}
 
     // 标记 imePatch 激活，用于主模块避免重复键盘钩子处理
     try { (window as any)._imePatchActive = true } catch {}
@@ -37,8 +50,12 @@
       }
     }
 
-    // prev snapshot for diff in input
-    const rememberPrev = () => {
+    // prev snapshot for diff in input — 懒快照：标记脏位，真正需要 diff 时才读取，避免每次输入复制几十KB文本
+    let _prevSnapshotDirty = true
+    const rememberPrev = () => { _prevSnapshotDirty = true }
+    const ensurePrevSnapshot = () => {
+      if (!_prevSnapshotDirty) return
+      _prevSnapshotDirty = false
       try {
         const ta = getEditor(); if (!ta) return
         ;(window as any)._edPrevVal = String(ta.value || '')
@@ -250,6 +267,7 @@
           rememberPrev()
           return
         }
+        ensurePrevSnapshot()
         const prev = String((window as any)._edPrevVal ?? '')
         const ps = ((window as any)._edPrevSelS >>> 0) || 0
         const pe = ((window as any)._edPrevSelE >>> 0) || ps

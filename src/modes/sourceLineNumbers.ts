@@ -530,13 +530,18 @@ function installLineNumbers(): void {
       rebuildLineStartsFrom(lines, lineStarts, startLine)
       lastText = text
       activeRow = 0
-      clearRenderedRows(false)
+      // 行数变化时才全量清空行号 DOM；同行编辑（如打字）只需就地更新几何信息
+      if (oldLineCount !== newLineCount) clearRenderedRows(false)
 
       if (!metrics || !rowHeights.length) return
 
       rowHeights.splice(startLine, oldLineCount, ...new Array<number>(newLineCount).fill(metrics.lineHeight))
       totalHeight = rebuildRowOffsetsFrom(rowHeights, rowOffsets, startLine)
-      remeasureRange(startLine, newLineCount, metrics)
+      // composing 期间跳过 DOM 测量（measureLineHeight 会触发回流）；compositionend 后只测量变化行
+      if (!_composing || _needsRemeasureAfterComposing) {
+        _needsRemeasureAfterComposing = false
+        remeasureRange(startLine, newLineCount, metrics)
+      }
     }
 
     const getVisibleRange = (metrics: Metrics): VisibleRange => {
@@ -582,18 +587,26 @@ function installLineNumbers(): void {
       lineNumbers.style.counterReset = `flymd-line ${range.startLine}`
 
       if (force || range.startLine !== renderedStartLine || range.endLine !== renderedEndLine) {
-        const frag = document.createDocumentFragment()
-        const nextRows: HTMLDivElement[] = []
-        for (let i = range.startLine; i < range.endLine; i++) {
-          const row = createRow()
-          setRowGeometry(row, rowOffsets[i] ?? 0, rowHeights[i] ?? currentMetrics.lineHeight)
-          nextRows.push(row)
-          frag.appendChild(row)
+        // 范围相同 + 已有渲染行：就地更新几何信息，避免 DOM 全量重建
+        if (range.startLine === renderedStartLine && range.endLine === renderedEndLine && renderedRows.length > 0) {
+          for (let i = 0; i < renderedRows.length; i++) {
+            const li = renderedStartLine + i
+            setRowGeometry(renderedRows[i], rowOffsets[li] ?? 0, rowHeights[li] ?? currentMetrics.lineHeight)
+          }
+        } else {
+          const frag = document.createDocumentFragment()
+          const nextRows: HTMLDivElement[] = []
+          for (let i = range.startLine; i < range.endLine; i++) {
+            const row = createRow()
+            setRowGeometry(row, rowOffsets[i] ?? 0, rowHeights[i] ?? currentMetrics.lineHeight)
+            nextRows.push(row)
+            frag.appendChild(row)
+          }
+          renderedRows = nextRows
+          renderedStartLine = range.startLine
+          renderedEndLine = range.endLine
+          lineNumbers.replaceChildren(frag)
         }
-        renderedRows = nextRows
-        renderedStartLine = range.startLine
-        renderedEndLine = range.endLine
-        lineNumbers.replaceChildren(frag)
       }
 
       const nextRow = findLineByPos(lineStarts, editor.selectionStart >>> 0, lastText.length) + 1
@@ -624,6 +637,22 @@ function installLineNumbers(): void {
       const activeChanged = nextLineNumbersActive !== lineNumbersActive
       lineNumbersActive = nextLineNumbersActive
       shell.classList.toggle('line-numbers-disabled', !lineNumbersActive)
+
+      // composing 期间跳过所有文本处理（全文 diff / rebuildLineStarts / rebuildRowOffsets 均 O(N)），
+      // 只做 scroll 同步和 active row 高亮，compositionend 会触发 needsLayoutRefresh 做完整刷新
+      if (_composing) {
+        if (lineNumbersActive) {
+          syncScroll()
+          // 只更新 active row 高亮
+          if (renderedRows.length && currentMetrics) {
+            const nextRow = findLineByPos(lineStarts, editor.selectionStart >>> 0, lastText.length) + 1
+            activeRow = setActiveRow(renderedRows, renderedStartLine, renderedEndLine, lines.length, nextRow, activeRow)
+          }
+        }
+        needsTextRefresh = false
+        needsLayoutRefresh = false
+        return
+      }
 
       const text = String(editor.value || '')
       const textChanged = needsTextRefresh || text !== lastText
@@ -703,9 +732,23 @@ function installLineNumbers(): void {
       flush()
     }
 
+    let _composing = false
+    let _needsRemeasureAfterComposing = false
+    editor.addEventListener('compositionstart', () => { _composing = true }, { passive: true } as any)
+    editor.addEventListener('compositionend', () => {
+      _composing = false
+      // compositionend 后需要处理 composing 期间积累的文本变化
+      // 标记需要 remeasure（在 applyTextPatch 中会对变化行做测量）
+      _needsRemeasureAfterComposing = true
+      needsTextRefresh = true
+      pendingInputPatch = null
+      schedule('text')
+    }, { passive: true } as any)
+
     const captureInputPatchHint = () => {
       try {
-        flushNowIfNeeded()
+        // composing 期间跳过同步 flush，避免 DOM 测量阻塞输入
+        if (!_composing) flushNowIfNeeded()
         pendingInputPatch = createInputPatchHint(
           lines,
           lineStarts,
@@ -718,7 +761,11 @@ function installLineNumbers(): void {
       }
     }
 
-    hookEditorTextMutations(editor, () => scheduleExternalTextRefresh())
+    hookEditorTextMutations(editor, () => {
+      // composing 期间延迟到 compositionend 后再通知，避免 imePatch 的 ta.value = newVal 触发额外同步刷新
+      if (_composing) return
+      scheduleExternalTextRefresh()
+    })
 
     editor.addEventListener('beforeinput', () => captureInputPatchHint(), { passive: true } as any)
     editor.addEventListener('input', () => schedule('text'))
